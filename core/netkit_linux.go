@@ -3,14 +3,178 @@
 
 package core
 
+/*
+#define _GNU_SOURCE
+#include <ctype.h>
+#include <limits.h>
+#include <net/if.h>
+#include <stdbool.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/stat.h>
+
+typedef struct {
+	char **items;
+	size_t count;
+} LinuxStringList;
+
+static void free_linux_string_list(LinuxStringList *list) {
+	if (!list || !list->items) {
+		return;
+	}
+	for (size_t i = 0; i < list->count; i++) {
+		free(list->items[i]);
+	}
+	free(list->items);
+	list->items = NULL;
+	list->count = 0;
+}
+
+LinuxStringList CopyLinuxDNSServers(const char *path) {
+	LinuxStringList list = {0};
+	if (!path) {
+		return list;
+	}
+	FILE *fp = fopen(path, "r");
+	if (!fp) {
+		return list;
+	}
+	char *line = NULL;
+	size_t lineCap = 0;
+	size_t capacity = 0;
+	while (getline(&line, &lineCap, fp) != -1) {
+		char *cursor = line;
+		while (*cursor && isspace((unsigned char)*cursor)) {
+			cursor++;
+		}
+		if (strncmp(cursor, "nameserver", 10) != 0 || (cursor[10] && !isspace((unsigned char)cursor[10]))) {
+			continue;
+		}
+		cursor += 10;
+		while (*cursor && isspace((unsigned char)*cursor)) {
+			cursor++;
+		}
+		if (*cursor == '\0' || *cursor == '#') {
+			continue;
+		}
+		char *end = cursor;
+		while (*end && !isspace((unsigned char)*end)) {
+			end++;
+		}
+		size_t length = (size_t)(end - cursor);
+		if (length == 0) {
+			continue;
+		}
+		char *value = (char *)malloc(length + 1);
+		if (!value) {
+			free_linux_string_list(&list);
+			break;
+		}
+		memcpy(value, cursor, length);
+		value[length] = '\0';
+		if (list.count == capacity) {
+			size_t newCapacity = capacity ? capacity * 2 : 4;
+			char **tmp = (char **)realloc(list.items, newCapacity * sizeof(char *));
+			if (!tmp) {
+				free(value);
+				free_linux_string_list(&list);
+				break;
+			}
+			list.items = tmp;
+			capacity = newCapacity;
+		}
+		list.items[list.count++] = value;
+	}
+	if (line) {
+		free(line);
+	}
+	fclose(fp);
+	return list;
+}
+
+void FreeLinuxStringList(LinuxStringList list) {
+	LinuxStringList temp = list;
+	free_linux_string_list(&temp);
+}
+
+char *CopyLinuxDefaultGateway(const char *iface) {
+	if (!iface) {
+		return NULL;
+	}
+	FILE *fp = fopen("/proc/net/route", "r");
+	if (!fp) {
+		return NULL;
+	}
+	char buffer[256];
+	if (!fgets(buffer, sizeof(buffer), fp)) {
+		fclose(fp);
+		return NULL;
+	}
+	while (fgets(buffer, sizeof(buffer), fp)) {
+		char dev[IFNAMSIZ] = {0};
+		unsigned long dest = 0;
+		unsigned long gateway = 0;
+		int fields = sscanf(buffer, "%63s %lx %lx", dev, &dest, &gateway);
+		if (fields < 3) {
+			continue;
+		}
+		if (strcmp(dev, iface) != 0 || dest != 0) {
+			continue;
+		}
+		char *result = (char *)malloc(16);
+		if (!result) {
+			break;
+		}
+		unsigned char bytes[4];
+		bytes[0] = (unsigned char)(gateway & 0xFF);
+		bytes[1] = (unsigned char)((gateway >> 8) & 0xFF);
+		bytes[2] = (unsigned char)((gateway >> 16) & 0xFF);
+		bytes[3] = (unsigned char)((gateway >> 24) & 0xFF);
+		snprintf(result, 16, "%u.%u.%u.%u", bytes[0], bytes[1], bytes[2], bytes[3]);
+		fclose(fp);
+		return result;
+	}
+	fclose(fp);
+	return NULL;
+}
+
+int LinuxIsWireless(const char *iface) {
+	if (!iface || iface[0] == '\0') {
+		return 0;
+	}
+	char path[PATH_MAX];
+	if (snprintf(path, sizeof(path), "/sys/class/net/%s/wireless", iface) > 0) {
+		struct stat st;
+		if (stat(path, &st) == 0) {
+			return 1;
+		}
+	}
+	char lower[IFNAMSIZ];
+	size_t len = strnlen(iface, IFNAMSIZ - 1);
+	for (size_t i = 0; i < len; i++) {
+		lower[i] = (char)tolower((unsigned char)iface[i]);
+	}
+	lower[len] = '\0';
+	if (strncmp(lower, "wl", 2) == 0) {
+		return 1;
+	}
+	if (strncmp(lower, "wlan", 4) == 0) {
+		return 1;
+	}
+	return 0;
+}
+*/
+import "C"
+
 import (
 	"bufio"
 	"fmt"
 	"net"
 	"os"
-	"path/filepath"
-	"strconv"
+	"runtime"
 	"strings"
+	"unsafe"
 )
 
 type LinuxNetkit struct{}
@@ -24,7 +188,10 @@ func NewLinuxNetkit() *LinuxNetkit { return &LinuxNetkit{} }
 func (p *LinuxNetkit) Hostname() (string, error) { return os.Hostname() }
 
 func (p *LinuxNetkit) DNSServers() ([]string, error) {
-	// No external commands; read resolv.conf directly
+	servers := getLinuxDNSServers("/etc/resolv.conf")
+	if len(servers) > 0 {
+		return servers, nil
+	}
 	return readResolvConfNameservers("/etc/resolv.conf"), nil
 }
 
@@ -114,43 +281,20 @@ func (p *LinuxNetkit) buildNetworkInterface(iface net.Interface) (NetworkInterfa
 }
 
 func (p *LinuxNetkit) isWireless(ifaceName string) bool {
-	// Use sysfs presence without commands
-	if _, err := os.Stat(filepath.Join("/sys/class/net", ifaceName, "wireless")); err == nil {
-		return true
-	}
-	n := strings.ToLower(ifaceName)
-	return strings.HasPrefix(n, "wl") || strings.HasPrefix(n, "wlan")
+	cName := C.CString(ifaceName)
+	defer C.free(unsafe.Pointer(cName))
+	return C.LinuxIsWireless(cName) != 0
 }
 
 func (p *LinuxNetkit) getDefaultGatewayFromProc(ifaceName string) string {
-	f, err := os.Open("/proc/net/route")
-	if err != nil {
+	cName := C.CString(ifaceName)
+	defer C.free(unsafe.Pointer(cName))
+	ptr := C.CopyLinuxDefaultGateway(cName)
+	if ptr == nil {
 		return ""
 	}
-	defer f.Close()
-	sc := bufio.NewScanner(f)
-	if !sc.Scan() {
-		return ""
-	} // skip header
-	for sc.Scan() {
-		fields := strings.Fields(sc.Text())
-		if len(fields) >= 3 && fields[0] == ifaceName && fields[1] == "00000000" {
-			return hexToIP(fields[2])
-		}
-	}
-	return ""
-}
-
-func hexToIP(hex string) string {
-	if len(hex) != 8 {
-		return ""
-	}
-	var ip [4]byte
-	for i := 0; i < 4; i++ {
-		val, _ := strconv.ParseUint(hex[i*2:i*2+2], 16, 8)
-		ip[3-i] = byte(val)
-	}
-	return fmt.Sprintf("%d.%d.%d.%d", ip[0], ip[1], ip[2], ip[3])
+	defer C.free(unsafe.Pointer(ptr))
+	return C.GoString(ptr)
 }
 
 func (p *LinuxNetkit) hasDhcpLease(ifaceName string) bool {
@@ -200,4 +344,31 @@ func readResolvConfNameservers(path string) []string {
 		}
 	}
 	return ns
+}
+
+func getLinuxDNSServers(path string) []string {
+	cPath := C.CString(path)
+	if cPath == nil {
+		return nil
+	}
+	defer C.free(unsafe.Pointer(cPath))
+
+	list := C.CopyLinuxDNSServers(cPath)
+	defer C.FreeLinuxStringList(list)
+
+	count := int(list.count)
+	if count == 0 || list.items == nil {
+		return nil
+	}
+
+	items := unsafe.Slice((**C.char)(list.items), count)
+	result := make([]string, 0, count)
+	for _, item := range items {
+		if item != nil {
+			result = append(result, C.GoString(item))
+		}
+	}
+
+	runtime.KeepAlive(list)
+	return result
 }
