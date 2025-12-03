@@ -62,6 +62,9 @@ jobs:
       - name: Build application
         run: make build
 
+      - name: Build application for all platforms
+        run: make build-all
+
       - name: Run example
         run: make run
 
