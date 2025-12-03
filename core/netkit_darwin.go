@@ -13,7 +13,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"unsafe"
 
 	"github.com/ebitengine/purego"
@@ -213,7 +212,7 @@ var (
 	cnCopySupportedInterfaces          func() CFArrayRef
 	cnCopyCurrentNetworkInfo           func(CFStringRef) CFDictionaryRef
 	dispatch_get_main_queue            func() unsafe.Pointer
-	dispatch_sync_f                    func(unsafe.Pointer, unsafe.Pointer, unsafe.Pointer)
+	dispatch_sync_f                    func(unsafe.Pointer, unsafe.Pointer, uintptr)
 
 	cfDictionaryTypeID   CFTypeID
 	cfArrayTypeID        CFTypeID
@@ -222,14 +221,10 @@ var (
 	cfDataTypeID         CFTypeID
 	coreWLANReady        bool
 	captiveNetworkReady  bool
-	dispatchCallback     unsafe.Pointer
+	dispatchCallback     uintptr
 	dispatchCallbackOnce sync.Once
-	dispatchContextID    uintptr
-	dispatchContextMu    sync.Mutex
-)
-
-var (
-	dispatchContextMap = map[uintptr]func(){}
+	dispatchCallbackMu   sync.Mutex
+	dispatchCallbackFn   func()
 )
 
 func ensureSystemConfiguration() error {
@@ -334,26 +329,28 @@ func runOnMainQueue(fn func()) bool {
 	if queue == nil {
 		return false
 	}
-	id := atomic.AddUintptr(&dispatchContextID, 1)
-	dispatchContextMu.Lock()
-	dispatchContextMap[id] = fn
-	dispatchContextMu.Unlock()
-	dispatch_sync_f(queue, unsafe.Pointer(id), dispatchCallback)
+	dispatchCallbackMu.Lock()
+	dispatchCallbackFn = fn
+	dispatchCallbackMu.Unlock()
+	defer func() {
+		dispatchCallbackMu.Lock()
+		dispatchCallbackFn = nil
+		dispatchCallbackMu.Unlock()
+	}()
+	dispatch_sync_f(queue, nil, dispatchCallback)
 	return true
 }
 
 func ensureDispatchCallback() {
 	dispatchCallbackOnce.Do(func() {
-		dispatchCallback = unsafe.Pointer(purego.NewCallback(func(ctx unsafe.Pointer) {
-			id := uintptr(ctx)
-			dispatchContextMu.Lock()
-			fn := dispatchContextMap[id]
-			delete(dispatchContextMap, id)
-			dispatchContextMu.Unlock()
+		dispatchCallback = purego.NewCallback(func(_ unsafe.Pointer) {
+			dispatchCallbackMu.Lock()
+			fn := dispatchCallbackFn
+			dispatchCallbackMu.Unlock()
 			if fn != nil {
 				fn()
 			}
-		}))
+		})
 	})
 }
 
@@ -1366,10 +1363,11 @@ func cStringToGoString(ptr *byte) string {
 	if ptr == nil {
 		return ""
 	}
+	const maxCStringLen = 1 << 30
+	buf := (*[maxCStringLen]byte)(unsafe.Pointer(ptr))
 	length := 0
-	for {
-		b := *(*byte)(unsafe.Pointer(uintptr(unsafe.Pointer(ptr)) + uintptr(length)))
-		if b == 0 {
+	for length < maxCStringLen {
+		if buf[length] == 0 {
 			break
 		}
 		length++
@@ -1377,8 +1375,10 @@ func cStringToGoString(ptr *byte) string {
 	if length == 0 {
 		return ""
 	}
-	bytes := unsafe.Slice(ptr, length)
-	return string(bytes)
+	data := unsafe.Slice(ptr, length)
+	result := string(data)
+	runtime.KeepAlive(ptr) // ensure pointer remains valid until after the copy
+	return result
 }
 
 func releaseCF(ref CFTypeRef) {
